@@ -120,6 +120,33 @@ cp .env.example .env   # add your free Gemini API key (aistudio.google.com/apike
 The web UI shows the verdict badge, the score with its reconciling reason, and the two
 readings side by side with disagreements highlighted.
 
+## Ota
+
+This repository includes an [`ota.yaml`](./ota.yaml) contract for deterministic verification, the
+local web runtime, the distributed A2A demo, and the Dockerfile-owned verification image. Install
+Ota from the [official installation guide](https://ota.run/docs/install), then inspect the
+contract-owned task surface before choosing a lane.
+
+```bash
+# validate the contract, inspect readiness, and list human and safe-agent commands
+ota validate .
+ota doctor
+ota tasks --use
+ota tasks --safe --use
+
+# run deterministic verification in the native repo-local virtual environment
+ota up --workflow verify
+
+# run deterministic verification in the repository Dockerfile image
+ota up --workflow verify:container
+
+# start the local web UI and prove its health endpoint
+ota up --workflow app
+```
+
+The `live` and `distributed` workflows require the external Gemini path. Inspect their effects
+and inputs with `ota tasks --use` before running them.
+
 ## Deploy (Cloud Run)
 
 One image, role picked by env var. See `DEPLOY.md` for the exact commands: two reader

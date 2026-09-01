@@ -1,0 +1,407 @@
+version: 1
+metadata:
+  ota:
+    minimum_version: "1.6.27"
+
+project:
+  name: lead-quorum
+  description: Distributed multi-agent lead qualifier with deterministic scoring, A2A readers, and a local web runtime
+  type: application
+
+execution:
+  default_context: host
+  contexts:
+    host:
+      backend: native
+    image:
+      backend: container
+      lifecycle: ephemeral
+      container:
+        image: lead-quorum:local
+
+toolchains:
+  python:
+    version: ">=3.12,<3.14"
+    package_managers:
+      uv: "*"
+    fulfillment:
+      source: uv
+      mode: none
+
+env:
+  vars:
+    GOOGLE_GENAI_USE_VERTEXAI:
+      default: "FALSE"
+      allowed:
+        - "FALSE"
+        - "TRUE"
+    GOOGLE_API_KEY:
+      secret: true
+    SERVICE:
+      default: web
+      allowed:
+        - web
+        - a2a
+    AGENT:
+      default: enrichment
+      allowed:
+        - enrichment
+        - rederive
+    PORT:
+      default: "8080"
+    PUBLIC_URL: {}
+    ENRICHMENT_CARD_URL: {}
+    REDERIVE_CARD_URL: {}
+  sources:
+    - kind: dotenv
+      path: .env
+
+checks:
+  - name: env-template-present
+    kind: file
+    severity: info
+    path: .env.example
+    expect: file
+
+surfaces:
+  web:
+    kind: http
+    purpose: Local lead-qualification UI
+    visibility: internal
+    port: 8000
+    path: /
+    readiness:
+      kind: http
+      path: /healthz
+
+tasks:
+  setup:
+    description: Materialize the local env file, create the repo virtualenv, and install pinned dependencies
+    category: setup
+    aggregate:
+      tasks:
+        - setup:env
+        - setup:venv
+        - setup:deps
+    notes: |
+      This setup path now uses first-class Ota ownership for both repo-local virtualenv
+      materialization and uv requirements-file hydration, without falling back to repo-local shell
+      setup glue.
+
+  setup:env:
+    description: Create `.env` from `.env.example` without overwriting existing local values
+    category: setup
+    internal: true
+    action:
+      kind: copy_if_missing
+      from: .env.example
+      to: .env
+    effects:
+      writes:
+        - .env
+    notes: |
+      The repo truth here is simple bootstrap copy semantics, so the narrower first-class
+      `copy_if_missing` action is the honest fit.
+
+  setup:venv:
+    description: Create the local uv-managed virtual environment
+    category: setup
+    internal: true
+    safe_for_agent: true
+    action:
+      kind: ensure_virtualenv
+      path: .venv
+      python: "3.12"
+    requirements:
+      toolchains:
+        - python
+    effects:
+      writes:
+        - .venv
+    notes: |
+      The repo intent here is now expressed through Ota's first-class virtualenv materialization
+      surface.
+
+  setup:deps:
+    description: Install the pinned Python dependencies into the repo virtual environment
+    category: setup
+    internal: true
+    safe_for_agent: true
+    prepare:
+      kind: dependency_hydration
+      medium: package_dependencies
+      source:
+        kind: uv
+        cwd: .
+        mode: pip_requirements
+        requirements_file: requirements.txt
+        default_index: https://pypi.org/simple
+    depends_on:
+      - setup:venv
+    requirements:
+      toolchains:
+        - python
+    effects:
+      writes:
+        - .venv
+      network: true
+      network_kind: dependency_hydration
+    notes: |
+      The repo truth here is `uv pip install -r requirements.txt`, and Ota owns that through the
+      typed uv `pip_requirements` hydration lane.
+
+  test:
+    description: Run the deterministic local test surface that does not require a Gemini API key
+    category: test
+    command:
+      exe: .venv/bin/python
+      args:
+        - -m
+        - pytest
+        - tests/test_scoring.py
+        - tests/test_corroboration.py
+        - tests/test_scoring_agent.py
+        - tests/test_distributed_build.py
+        - -q
+    safe_for_agent: true
+    depends_on:
+      - setup:venv
+      - setup:deps
+    requirements:
+      toolchains:
+        - python
+    notes: |
+      This is the canonical verification lane for fresh contributors and CI because it stays
+      deterministic and does not require `GOOGLE_API_KEY`.
+
+  test:live:
+    description: Run the live Gemini-backed end-to-end test
+    category: test
+    command:
+      exe: .venv/bin/python
+      args:
+        - -m
+        - pytest
+        - tests/test_pipeline_live.py
+        - -q
+    requirements:
+      toolchains:
+        - python
+      env:
+        - GOOGLE_API_KEY
+    depends_on:
+      - setup:env
+      - setup:venv
+      - setup:deps
+    effects:
+      network: true
+      network_kind: integration_test
+      external_state:
+        - google_genai_api
+    notes: |
+      This lane is intentionally separate from the default test surface because it depends on live
+      external API reachability and quota.
+
+  dev:
+    description: Start the local web UI with the single-process pipeline
+    category: dev
+    launch:
+      kind: command
+      exe: .venv/bin/uvicorn
+      args:
+        - web.app:app
+      runtime_projection:
+        listener: web
+        adapter: uvicorn
+    runtime:
+      kind: service
+      surfaces:
+        web:
+          bind:
+            address: 127.0.0.1
+            port:
+              mode: fixed
+              value: 8000
+          project:
+            host:
+              address: 127.0.0.1
+              port:
+                mode: fixed
+                value: 8000
+              primary: true
+              path: /
+    requirements:
+      toolchains:
+        - python
+    depends_on:
+      - setup:env
+      - setup:venv
+      - setup:deps
+    effects:
+      network: true
+      network_kind: broad
+      external_state:
+        - google_genai_api
+    notes: |
+      The service can boot and answer `/healthz` without a live API key, but meaningful lead
+      qualification still depends on `GOOGLE_API_KEY` at request time.
+
+  demo:distributed:
+    description: Run the local distributed A2A demo with two reader services plus the remote orchestrator
+    category: integration
+    command:
+      exe: .venv/bin/python
+      args:
+        - scripts/demo_distributed.py
+    requirements:
+      toolchains:
+        - python
+      env:
+        - GOOGLE_API_KEY
+    depends_on:
+      - setup:env
+      - setup:venv
+      - setup:deps
+    effects:
+      network: true
+      network_kind: integration_test
+      external_state:
+        - google_genai_api
+    notes: |
+      This is the repo's local distributed proof lane. It spins up both A2A readers and then runs
+      the remote orchestrator against them over localhost.
+
+  docker:build:
+    description: Build the repo's single-image container artifact
+    category: build
+    action:
+      kind: build_container_image
+      file: Dockerfile
+      context: .
+      tag: lead-quorum:local
+    requirements:
+      tools:
+        docker: "*"
+    effects:
+      network: true
+      network_kind: broad
+      external_state:
+        - docker
+    notes: |
+      This builds the Dockerfile image consumed by `test:container`. The broad network effect
+      makes the resulting verification closure non-agent-safe.
+
+  test:container:
+    context: image
+    description: Run the deterministic verification surface inside the repository Dockerfile image
+    category: test
+    command:
+      exe: python
+      args:
+        - -m
+        - pytest
+        - tests/test_scoring.py
+        - tests/test_corroboration.py
+        - tests/test_scoring_agent.py
+        - tests/test_distributed_build.py
+        - -q
+    notes: |
+      This is the container-owned counterpart to `test`. It proves the deterministic suite using
+      the dependencies baked into the repository's Dockerfile image, not the native `.venv` lane.
+      Use `ota up --workflow verify:container` to build the image before this lane runs.
+
+workflows:
+  default: app
+
+  app:
+    intent: local_development
+    description: Canonical local web workflow for the Lead Quorum UI
+    setup:
+      task: setup
+    run:
+      task: dev
+    readiness:
+      surfaces:
+        - web
+    exposes:
+      - surface: web
+    notes: |
+      Use this when you want the local web UI up and want Ota to prove the service reaches
+      `/healthz`.
+
+  verify:
+    intent: ci_validation
+    description: Canonical deterministic verification workflow
+    setup:
+      task: setup
+    run:
+      task: test
+    proof:
+      claim: bounded
+    notes: |
+      This is the stable default verification path for CI and agents because it does not require a
+      live API key. Its bounded proof claim remains unknown until this exact workflow produces a
+      matching immutable runtime-proof archive.
+
+  verify:container:
+    intent: ci_validation
+    description: Deterministic verification in the repository Dockerfile image
+    setup:
+      task: docker:build
+    run:
+      task: test:container
+    notes: |
+      This proves the Dockerfile-owned runtime path. Its host build setup has broad network effects,
+      so it is a human/CI execution lane rather than an agent-safe closure.
+
+  live:
+    description: Live end-to-end verification against Gemini
+    setup:
+      task: setup
+    run:
+      task: test:live
+    notes: |
+      This is intentionally a separate verification workflow because it depends on external quota,
+      secrets, and non-local reachability.
+
+  distributed:
+    description: Local distributed A2A proof through the demo script
+    setup:
+      task: setup
+    run:
+      task: demo:distributed
+    notes: |
+      Use this when you want the repo's full local multi-service topology rather than the
+      single-process pipeline.
+
+agent:
+  posture: readiness_strict
+  entrypoint: setup
+  default_task: test
+  safe_tasks:
+    - test
+  verify_after_changes:
+    - test
+  writable_paths:
+    - agents
+    - core
+    - scripts
+    - tests
+    - web
+    - .venv
+  protected_paths:
+    - .env
+    - .github/workflows
+    - ota.yaml
+    - requirements.txt
+  bootstrap:
+    ota:
+      note: Only install ota if it is missing and installation is approved.
+      source:
+        kind: version
+        version: v1.6.27
+  notes: |
+    Start with `ota validate`, then `ota doctor`, then `ota tasks --use`.
+    Prefer `ota up --workflow verify` for deterministic validation and use the `live` or
+    `distributed` workflows only when the repo's external Gemini-backed paths are intentionally
+    under test.

@@ -1,0 +1,236 @@
+name: "Evidence: Ota contract matrix (non-blocking)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+
+concurrency:
+  group: ota-contract-matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OTA_NO_UPDATE_CHECK: "1"
+
+jobs:
+  contract-ci-drift:
+    name: Contract-to-CI drift
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Fail on contract-to-CI workflow drift
+        uses: ota-run/action@6bb5bf686df5a8385202c8c20b6f91c045e3c161 # v1.0.15
+        with:
+          command: doctor
+          source: contract
+          fail-on-error: false
+          fail-on-ci-drift: true
+          comment-pr: false
+
+  native:
+    name: Ota Contract Matrix (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            os: ubuntu-latest
+            native_execution: true
+            full_runtime_proof: true
+          - name: macos
+            os: macos-latest
+            native_execution: true
+            full_runtime_proof: true
+          - name: windows
+            os: windows-latest
+            native_execution: false
+            full_runtime_proof: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+
+      - name: Set up ota
+        uses: ota-run/setup@85bf49c11a5aa3ddedfa56c47682cfd40b238f1f # v1.0.9
+        with:
+          source: contract
+          contract-path: ota.yaml
+
+      - name: Show runtime versions
+        shell: bash
+        run: |
+          python --version
+          uv --version
+          ota --version
+
+      - name: Validate contract
+        shell: bash
+        run: |
+          ota validate --json . > ota-validate.json
+          ota validate .
+
+      - name: List task surfaces
+        shell: bash
+        run: |
+          ota tasks --use .
+          ota tasks --safe --use .
+
+      - name: List workflows
+        shell: bash
+        run: ota workflows .
+
+      - name: Execute setup task
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: ota run setup --stream .
+
+      - name: Doctor contract
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: |
+          ota doctor --workflow verify --json . > ota-doctor.json
+          ota doctor --workflow verify .
+
+      - name: Dry-run supported task surface
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: |
+          ota run setup --dry-run --json .
+          ota run test --dry-run --json .
+          ota run test:live --dry-run --json .
+          ota run demo:distributed --dry-run --json .
+
+      - name: Dry-run Docker build lane
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        shell: bash
+        run: ota run docker:build --dry-run --json .
+
+      - name: Dry-run workflows
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: |
+          ota up --workflow verify --dry-run --json .
+          ota up --workflow app --dry-run --json .
+          ota up --workflow live --dry-run --json .
+          ota up --workflow distributed --dry-run --json .
+
+      - name: Execute deterministic task surface
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: ota run test --stream .
+
+      - name: Execute deterministic verification workflow
+        if: ${{ matrix.native_execution }}
+        shell: bash
+        run: ota up --workflow verify --stream .
+
+      - name: Execute app workflow runtime proof
+        if: ${{ matrix.native_execution && matrix.full_runtime_proof }}
+        shell: bash
+        run: ota proof runtime --json --workflow app . > ota-proof-runtime.json
+
+      - name: Build Docker image
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        shell: bash
+        run: ota run docker:build --stream .
+
+      - name: Upload Ota evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ota-contract-matrix-${{ matrix.name }}
+          path: |
+            ota-validate.json
+            ota-doctor.json
+            ota-proof-runtime.json
+            .ota/receipts/**
+          if-no-files-found: ignore
+
+  container:
+    name: Ota Container Verification
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Python 3.12 for contract diagnosis
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up ota
+        uses: ota-run/setup@85bf49c11a5aa3ddedfa56c47682cfd40b238f1f # v1.0.9
+        with:
+          source: contract
+          contract-path: ota.yaml
+
+      - name: Validate contract
+        shell: bash
+        run: ota validate .
+
+      - name: List task surfaces
+        shell: bash
+        run: |
+          ota tasks --use .
+          ota tasks --safe --use .
+
+      - name: Build Dockerfile image
+        shell: bash
+        run: ota run docker:build --stream .
+
+      - name: Dry-run container verification workflow
+        shell: bash
+        run: ota up --workflow verify:container --dry-run --json .
+
+      - name: Dry-run container verification task
+        shell: bash
+        run: ota run test:container --dry-run --json .
+
+      - name: Diagnose container verification workflow
+        shell: bash
+        run: ota doctor --workflow verify:container --json . > ota-container-doctor.json
+
+      - name: Execute container verification workflow
+        shell: bash
+        run: ota up --workflow verify:container --stream .
+
+      - name: Execute container verification task
+        shell: bash
+        run: ota run test:container --stream .
+
+      - name: Archive container receipt
+        shell: bash
+        run: ota receipt --workflow verify:container --json --archive .
+
+      - name: Upload Ota container evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ota-container-diagnostics
+          path: |
+            ota-container-doctor.json
+            .ota/receipts/**
+          if-no-files-found: ignore

@@ -7,11 +7,12 @@ output varies, but the score must always reconcile to its reason.
 
 import asyncio
 import os
+from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
 
-load_dotenv("/Users/vinicius/Code/adk-lead-qualifier/.env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GOOGLE_API_KEY"), reason="no GOOGLE_API_KEY in .env"
